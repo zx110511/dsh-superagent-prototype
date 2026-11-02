@@ -136,14 +136,22 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const directory = mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   const repository = { default_branch: 'master', permissions: { push: true } }
-  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
+  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => {
+    if (args[0] === 'dazi-app' && args[1] === 'identity') return { version: 1, app: { id: 42, slug: 'agent-bot' }, bot: { id: 7, login: 'agent-bot[bot]' },
+      repository: { id: 99, full_name: 'acme/widgets' }, permissions: { contents: 'write', issues: 'write', pull_requests: 'write', checks: 'read', statuses: 'read', metadata: 'read' },
+      expires_at: new Date(Date.now() + 3_600_000).toISOString(), token_sha256: 'a'.repeat(64) }
+    if (args[0] === 'api' && args[1] === 'installation/repositories') return [{ total_count: 1, repositories: [{ id: 99, full_name: 'acme/widgets' }] }]
+    return repository
+  })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
   vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
   const scoped = 'git config -z --show-scope --get-regexp ^(credential\\..*|http\\..*extraheader)$'
   const answers: Record<string, string> = {
-    [`${AGENT} api user`]: '{"login":"agent-bot","id":7}',
-    [`${AGENT} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`]: '{"name":"acme/widgets","push":true}\n',
+    [`${AGENT} dazi-app identity`]: JSON.stringify({ version: 1, app: { id: 42, slug: 'agent-bot' }, bot: { id: 7, login: 'agent-bot[bot]' },
+      repository: { id: 99, full_name: 'acme/widgets' }, permissions: { contents: 'write', issues: 'write', pull_requests: 'write', checks: 'read', statuses: 'read', metadata: 'read' },
+      expires_at: new Date(Date.now() + 3_600_000).toISOString(), token_sha256: 'a'.repeat(64) }) + '\n',
+    [`${AGENT} api installation/repositories --paginate --slurp`]: JSON.stringify([{ total_count: 1, repositories: [{ id: 99, full_name: 'acme/widgets' }] }]) + '\n',
     [`${BOT} auth status`]: JSON.stringify({ appId: 'cli_bot', brand: 'feishu', identities: { bot: { status: 'ready' } } }),
     [`${BOT} config strict-mode`]: 'strict-mode: bot (source: profile)',
     [`${BOT} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',

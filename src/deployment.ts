@@ -75,8 +75,27 @@ export function workerProbe(subprocess: SubprocessRuntime, stateDir: string, cwd
   return argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...argv], cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
 }
 
-const GithubUser = z.object({ login: z.string().regex(/^[A-Za-z0-9-]+$/), id: z.number().int().positive() })
-const RepositoryAccess = z.object({ name: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/), push: z.boolean().nullable() })
+const GithubId = z.number().int().positive().max(Number.MAX_SAFE_INTEGER)
+const RepositoryName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/)
+  .refine(name => !['.', '..'].includes(name.split('/')[1]!))
+// This is the wrapper's credential-free protocol, not a personal account or raw token response.
+const AppIdentity = z.strictObject({
+  version: z.literal(1),
+  app: z.strictObject({ id: GithubId, slug: z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$/) }),
+  bot: z.strictObject({ id: GithubId, login: z.string() }),
+  repository: z.strictObject({ id: GithubId, full_name: RepositoryName }),
+  permissions: z.strictObject({ contents: z.literal('write'), issues: z.literal('write'), pull_requests: z.literal('write'),
+    checks: z.literal('read'), statuses: z.literal('read'), metadata: z.literal('read') }),
+  expires_at: z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/).refine(value => {
+    const time = Date.parse(value)
+    const now = Date.now()
+    return Number.isFinite(time) && new Date(time).toISOString().replace('.000Z', 'Z') === value.replace('.000Z', 'Z')
+      && time > now && time <= now + 3_660_000
+  }),
+  token_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+}).refine(info => info.bot.login === `${info.app.slug}[bot]`)
+const InstallationRepositories = z.array(z.looseObject({ total_count: z.literal(1),
+  repositories: z.array(z.looseObject({ id: GithubId, full_name: RepositoryName })) })).min(1)
 function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   let value: unknown
   try { value = JSON.parse(text) } catch { return undefined /* Non-JSON output; the caller surfaces the setup failure. */ }
@@ -92,17 +111,20 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   if (!accounts.cli) throw new SetupError('agentCliUnset')
   let cli: string
   try { cli = executable(accounts.cli, path, workerBin(stateDir)) } catch (error) { throw new SetupError('agentCliMissing', { output: reason(error) }) }
-  const text = await probe([cli, 'api', 'user']).catch((error: unknown) => { throw new SetupError('agentCliSignedOut', { output: reason(error) }) })
-  const agent = parsed(GithubUser, text)
-  if (!agent) throw new SetupError('agentCliNoAccount')
-  // Use the canonical repository name returned by GitHub so renamed repositories match incoming notifications.
-  const access = parsed(RepositoryAccess, await probe([cli, 'api', `repos/${remote}`, '--jq', '{name: .full_name, push: .permissions.push}']).catch((error: unknown) => {
-    throw new SetupError('repositoryUnreadable', { account: agent.login, repository: remote, output: reason(error) })
+  const text = await probe([cli, 'dazi-app', 'identity']).catch(() => { throw new SetupError('agentCliSignedOut') })
+  const identity = parsed(AppIdentity, text)
+  if (!identity) throw new SetupError('agentCliNoAccount')
+  if (identity.repository.full_name !== remote) throw new SetupError('repositoryUnreported', { repository: remote })
+  const agent = identity.bot
+  // Never surface wrapper output/errors: even a misconfigured CLI may print credential material.
+  const pages = parsed(InstallationRepositories, await probe([cli, 'api', 'installation/repositories', '--paginate', '--slurp']).catch(() => {
+    throw new SetupError('repositoryUnreadable', { account: agent.login, repository: remote })
   }))
-  if (!access) throw new SetupError('repositoryUnreported', { repository: remote })
-  const repository = access.name
-  if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
-  return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+  const repositories = pages?.flatMap(page => page.repositories)
+  if (repositories?.length !== 1 || repositories[0]!.id !== identity.repository.id || repositories[0]!.full_name !== remote) {
+    throw new SetupError('repositoryUnreported', { repository: remote })
+  }
+  return { ...machine, repository: remote, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })
