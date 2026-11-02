@@ -11,8 +11,14 @@ const exec = promisify(execFile)
 let dir: string
 let path: string
 const program = (file: string, body = ''): string => { writeFileSync(file, `#!/bin/sh\n${body}\n`); chmodSync(file, 0o755); return file }
-/** Fake gh CLI signed in as `login` with configurable push access to acme/widgets (including its former name acme/gadgets). */
-const gh = (file: string, login: string, push = true): string => program(file, `case "$*" in\n  "api user") echo '{"login":"${login}","id":7}' ;;\n  "api repos/acme/"*" --jq {name: .full_name, push: .permissions.push}") echo '{"name":"acme/widgets","push":${push}}' ;;\n  *) exit 1 ;;\nesac`)
+/** Credential-free output of the App wrapper; only its bot identity is used for startup. */
+const identity = (overrides: Record<string, unknown> = {}) => ({ version: 1, app: { id: 42, slug: 'agent-bot' },
+  bot: { id: 7, login: 'agent-bot[bot]' }, repository: { id: 99, full_name: 'acme/widgets' },
+  permissions: { contents: 'write', issues: 'write', pull_requests: 'write', checks: 'read', statuses: 'read', metadata: 'read' },
+  expires_at: new Date(Date.now() + 3_600_000).toISOString(), token_sha256: 'a'.repeat(64), ...overrides })
+const repositories = [{ total_count: 1, repositories: [{ id: 99, full_name: 'acme/widgets', private: true }] }]
+/** A real subprocess fixture supporting only the App protocol and installation repository probe. */
+const gh = (file: string): string => program(file, `case "$*" in\n  "dazi-app identity") echo '${JSON.stringify(identity())}' ;;\n  "api installation/repositories --paginate --slurp") echo '${JSON.stringify(repositories)}' ;;\n  *) exit 1 ;;\nesac`)
 /** Fake lark-cli script body returning canned auth, strict-mode, and bot info responses. */
 const lark = (status: object, mode = 'bot', bot: object = { bot: { open_id: 'ou_bot', app_name: 'Widgets Bot' }, code: 0 }): string =>
   `case "$*" in\n  "auth status") echo '${JSON.stringify(status)}' ;;\n  "config strict-mode") echo 'strict-mode: ${mode} (source: profile)' ;;\n  "api GET /open-apis/bot/v3/info --as bot --format ndjson") echo '${JSON.stringify(bot)}' ;;\nesac`
@@ -26,7 +32,7 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'deployment-'))
   mkdirSync(join(dir, 'bin')); mkdirSync(join(dir, 'state', 'worker-bin'), { recursive: true }); mkdirSync(join(dir, 'widgets', 'src'), { recursive: true })
   path = [join(dir, 'state-link', 'worker-bin'), `${join(dir, 'state', 'worker-bin')}/`, join(dir, 'bin'), '/usr/bin', '/bin'].join(':')
-  gh(join(dir, 'bin', 'gh'), 'Agent-Bot')
+  gh(join(dir, 'bin', 'gh'))
   program(join(dir, 'bin', 'lark-cli'), lark({ appId: 'cli_bot', brand: 'lark', identities: { bot: { status: 'ready' } } }))
   // Stale worker shims with the same binary name must be skipped regardless of PATH normalization or symlinks.
   program(join(dir, 'state', 'worker-bin', 'gh'))
@@ -57,13 +63,79 @@ describe('configuration schema', () => {
 })
 
 describe('setup', () => {
-  it('reads the repository from the GitHub Source and the accounts from their CLIs, skipping the worker shims', async () => {
-    const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
-    expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
-    expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
+  it('reads the App bot identity and bound repository, skipping worker shims without an api user fallback', async () => {
+    const calls: string[][] = []
+    const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, async argv => {
+      calls.push(argv); return probe(argv)
+    }, path)
+    expect(deployment.repository).toBe('acme/widgets')
+    expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'agent-bot[bot]', noreply: '7+agent-bot[bot]@users.noreply.github.com' })
     expect(deployment).not.toHaveProperty('feishu')
-    // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
-    expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
+    expect(calls.map(argv => argv.slice(1))).toEqual([['dazi-app', 'identity'], ['api', 'installation/repositories', '--paginate', '--slurp']])
+    // Renaming requires reissuing the binding and reconfiguring the Source, never silent canonical rebinding.
+    await expect(resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path))
+      .rejects.toEqual(setupError('github', 'repositoryUnreported', { repository: 'acme/gadgets' }))
+  })
+  it.each([
+    ['account-era output', () => ({ login: 'alice', id: 7 })],
+    ['unknown root field', () => identity({ token: 'secret-marker' })],
+    ['wrong version', () => identity({ version: 2 })],
+    ['missing field', () => { const { token_sha256: _, ...rest } = identity(); return rest }],
+    ['extra app field', () => identity({ app: { id: 42, slug: 'agent-bot', token: 'secret-marker' } })],
+    ['extra bot field', () => identity({ bot: { id: 7, login: 'agent-bot[bot]', type: 'Bot' } })],
+    ['extra repository field', () => identity({ repository: { id: 99, full_name: 'acme/widgets', private: true } })],
+    ['unsafe app id', () => identity({ app: { id: Number.MAX_SAFE_INTEGER + 1, slug: 'agent-bot' } })],
+    ['zero bot id', () => identity({ bot: { id: 0, login: 'agent-bot[bot]' } })],
+    ['fractional repository id', () => identity({ repository: { id: 1.5, full_name: 'acme/widgets' } })],
+    ['uppercase slug', () => identity({ app: { id: 42, slug: 'Agent-Bot' } })],
+    ['invalid slug', () => identity({ app: { id: 42, slug: '-agent-' } })],
+    ['mismatched bot', () => identity({ bot: { id: 7, login: 'other[bot]' } })],
+    ['invalid repository', () => identity({ repository: { id: 99, full_name: 'acme/..' } })],
+    ['extra permission', () => identity({ permissions: { ...identity().permissions, administration: 'read' } })],
+    ['missing permission', () => identity({ permissions: { contents: 'write' } })],
+    ['read-only contents', () => identity({ permissions: { ...identity().permissions, contents: 'read' } })],
+    ['elevated checks', () => identity({ permissions: { ...identity().permissions, checks: 'write' } })],
+    ['expired', () => identity({ expires_at: new Date(Date.now() - 1).toISOString() })],
+    ['excessive lifetime', () => identity({ expires_at: new Date(Date.now() + 3_661_000).toISOString() })],
+    ['non-ISO expiry', () => identity({ expires_at: 'tomorrow' })],
+    ['normalized invalid date', () => identity({ expires_at: '2026-02-30T00:00:00Z' })],
+    ['invalid hash', () => identity({ token_sha256: 'secret-marker' })],
+  ])('rejects invalid App identity: %s', async (_label, value) => {
+    const run: Probe = async () => JSON.stringify(value())
+    await expect(resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, run, path))
+      .rejects.toEqual(setupError('github', 'agentCliNoAccount'))
+  })
+  it.each([
+    ['no pages', []], ['unwrapped page', repositories[0]],
+    ['missing repositories', [{ total_count: 1 }]], ['empty repository list', [{ total_count: 1, repositories: [] }]],
+    ['wrong count', [{ ...repositories[0], total_count: 2 }]],
+    ['changed ID', [{ total_count: 1, repositories: [{ id: 100, full_name: 'acme/widgets' }] }]],
+    ['renamed repository', [{ total_count: 1, repositories: [{ id: 99, full_name: 'acme/gadgets' }] }]],
+    ['second repository', [{ total_count: 1, repositories: [...repositories[0]!.repositories, { id: 100, full_name: 'acme/other' }] }]],
+    ['extra repository on later page', [...repositories, { total_count: 1, repositories: [{ id: 100, full_name: 'acme/other' }] }]],
+    ['inconsistent later count', [...repositories, { total_count: 2, repositories: [] }]],
+  ])('rejects installation access: %s', async (_label, pages) => {
+    const run: Probe = async argv => JSON.stringify(argv[1] === 'dazi-app' ? identity() : pages)
+    await expect(resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, run, path))
+      .rejects.toEqual(setupError('github', 'repositoryUnreported', { repository: 'acme/widgets' }))
+  })
+  it('does not disclose raw identity or subprocess errors and never falls back to a personal account', async () => {
+    for (const stage of ['dazi-app', 'api']) {
+      const calls: string[][] = []
+      const run: Probe = async argv => {
+        calls.push(argv)
+        if (argv[1] === stage) throw new Error('secret-marker')
+        return JSON.stringify(identity())
+      }
+      const error = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, run, path).catch(error => error)
+      expect(error).toEqual(setupError('github', stage === 'api' ? 'repositoryUnreadable' : 'agentCliSignedOut'))
+      expect(JSON.stringify(error)).not.toContain('secret-marker')
+      expect(String(error)).not.toContain('secret-marker')
+      expect(calls.some(argv => argv.includes('user'))).toBe(false)
+    }
+    const legacy = program(join(dir, 'bin', 'gh-legacy'), `case "$*" in\n  "api user") echo '{"login":"alice","id":7}' ;;\n  *) exit 1 ;;\nesac`)
+    await expect(resolveDeployment(machine(), { repository: 'acme/widgets', cli: legacy }, probe, path))
+      .rejects.toEqual(setupError('github', 'agentCliSignedOut'))
   })
   it('names what setup needs and where it is set', async () => {
     const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown) =>
@@ -74,12 +146,10 @@ describe('setup', () => {
     await needs('github', 'agentCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }, { repository, cli: join(dir, 'missing') })
     await needs('github', 'agentCliMissing', { output: 'bin/gh must be a command name or an absolute path' }, { repository, cli: 'bin/gh' })
     await needs('github', 'agentCliSignedOut', {}, { repository, cli: program(join(dir, 'bin', 'gh-broken'), 'exit 1') })
-    await needs('github', 'repositoryReadOnly', { account: 'Agent-Bot', repository: 'acme/widgets' }, { repository, cli: gh(join(dir, 'bin', 'gh-reader'), 'Agent-Bot', false) })
-    // Signed in, but the account cannot read the repository, or the CLI names no account.
+    // A valid App identity is not enough without the live installation repository probe.
     const unreadable = program(join(dir, 'bin', 'gh-outsider'),
-      `case "$*" in\n  "api user") echo '{"login":"Agent-Bot","id":7}' ;;\n  *) echo 'HTTP 404' >&2; exit 1 ;;\nesac`)
-    const output = expect.stringContaining('HTTP 404') as unknown
-    await needs('github', 'repositoryUnreadable', { account: 'Agent-Bot', repository: 'acme/widgets', output }, { repository, cli: unreadable })
+      `case "$*" in\n  "dazi-app identity") echo '${JSON.stringify(identity())}' ;;\n  *) echo 'HTTP 404' >&2; exit 1 ;;\nesac`)
+    await needs('github', 'repositoryUnreadable', { account: 'agent-bot[bot]', repository }, { repository, cli: unreadable })
     await needs('github', 'agentCliNoAccount', {}, { repository, cli: program(join(dir, 'bin', 'gh-anonymous'), `echo '{}'`) })
     expect(() => executable('nothing-here', join(dir, 'bin'))).toThrow('nothing-here is not an executable file on PATH')
   })

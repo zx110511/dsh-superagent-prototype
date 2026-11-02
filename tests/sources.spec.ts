@@ -68,10 +68,11 @@ const agentsPull = (number: number, ref: string): Pull =>
 const openPull = (number: number) => ({ number, title: 'Fix the margin', state: 'open',
   html_url: `https://github.com/acme/widgets/pull/${number}`, user: { login: 'carol' },
   head: { sha: 'abc', ref: 'fix', repo: { full_name: 'acme/widgets' } } })
-const notification = (number: number, kind: 'issues' | 'pulls' = 'issues') => ({ id: `n${number}`, updated_at: '2026-09-09T00:00:00Z',
-  reason: 'mention',
-  repository: { full_name: 'acme/widgets' }, subject: { url: `https://api.github.com/repos/acme/widgets/${kind}/${number}`,
-    type: kind === 'pulls' ? 'PullRequest' : 'Issue', title: '' } })
+const change = (number: number, kind: 'issues' | 'pulls' = 'issues'): GithubIssue => ({ id: 1000 + number, number,
+  title: `Issue ${number}`, body: 'details', state: 'open', user: { login: 'alice', type: 'User' },
+  created_at: '2026-09-09T00:00:00Z', updated_at: '2026-09-09T00:00:00Z',
+  html_url: `https://github.com/acme/widgets/issues/${number}`,
+  ...kind === 'pulls' ? { pull_request: { url: `https://api.github.com/repos/acme/widgets/pulls/${number}` } } : {} })
 const refused = (status: number, text: string) => commandError({ stderr: `gh: ${text} (HTTP ${status})`, code: 1 })
 /** Stubs `gh api` calls against `acme/widgets` and returns the requested paths in order. */
 function github(h: ReturnType<typeof host>, routes: Record<string, unknown>): string[] {
@@ -554,10 +555,10 @@ describe('github source', () => {
       html_url: 'https://github.com/acme/widgets/pull/9', user: { login: 'agent-bot' },
       head: { sha: 'abc', ref: 'agent/nine', repo: { full_name: 'acme/widgets' } } }
     const checks = { check_runs: [{ name: 'test', status: 'in_progress', conclusion: null }] }
-    const routes: Record<string, unknown> = { notifications: [notification(9, 'pulls')], 'pulls/9': pr, 'commits/abc/check-runs': checks }
+    const routes: Record<string, unknown> = { issues: [change(9, 'pulls')], 'pulls/9': pr, 'commits/abc/check-runs': checks }
     const reads = github(h, routes)
     await pollRound(h)
-    // The notification, the ticket's PR and the subscribed Thread share one read of the PR.
+    // The change, the ticket's PR and the subscribed Thread share one read of the PR.
     expect(reads.filter(path => path === 'pulls/9')).toHaveLength(1)
     const facts = () => h.store.threads.get('github:9')!.meta.facts as Record<string, unknown>
     expect(facts()).toMatchObject({ autoMerge: { label: { zh: '自动合并', en: 'Auto-merge' } }, ci: { value: '1' } })
@@ -580,7 +581,7 @@ describe('github source', () => {
     const mention = (id: number, number: number, at: string): GithubComment => ({ id, body: '@agent-bot take this',
       user: { login: 'alice', type: 'User' }, html_url: `https://github.com/acme/widgets/issues/${number}#issuecomment-${id}`,
       created_at: at, updated_at: at })
-    const routes: Record<string, unknown> = { notifications: [notification(12), notification(13)], 'issues/12': refused(502, 'Bad Gateway'),
+    const routes: Record<string, unknown> = { issues: [change(12), change(13)], 'issues/12': refused(502, 'Bad Gateway'),
       'issues/13': issue(13, { created_at: '2026-08-01T00:00:00Z' }),
       'issues/13/comments': [mention(1, 13, '2026-09-08T01:00:00Z')] }
     github(h, routes)
@@ -591,7 +592,7 @@ describe('github source', () => {
     expect(Date.parse(h.store.get<string>('github-since')!)).toBeGreaterThan(Date.parse('2026-09-08T00:00:00.000Z'))
     expect(h.store.get('github-retry')).toEqual({ 12: { since: '2026-09-08T00:00:00.000Z', pr: false, attempts: 1, failedAt: expect.any(String) } })
     expect(h.store.threads.get('github:12')!.meta.pollError).toContain('Bad Gateway')
-    Object.assign(routes, { notifications: [], 'issues/12': issue(12, { created_at: '2026-08-01T00:00:00Z' }),
+    Object.assign(routes, { issues: [], 'issues/12': issue(12, { created_at: '2026-08-01T00:00:00Z' }),
       'issues/12/comments': [mention(2, 12, '2026-09-08T02:00:00Z')] })
     await pollRound(h)
     expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.number)).toEqual([13, 12])
@@ -606,53 +607,54 @@ describe('github source', () => {
     h.store.threads.save({ key: 'github:14', ref: { source: 'github', id: '14' }, createdAt: '', lastAt: new Date().toISOString(),
       subscriptions: ['t14'], correlated: [], pending: [], meta: { number: 14, isPr: false, title: 'Gone' } })
     const deleted = refused(410, 'This issue was deleted')
-    github(h, { notifications: [notification(14), notification(15)], 'issues/14': deleted, 'issues/15': deleted })
+    github(h, { issues: [change(14), change(15)], 'issues/14': deleted, 'issues/15': deleted })
     await pollRound(h)
     expect(h.store.get('github-retry')).toEqual({})
     // Dropping a read moves no read position.
     expect(h.store.get('github-cursor:14')).toBeUndefined()
     expect(h.store.threads.get('github:14')!.meta.pollError).toContain('deleted')
     // Without a Thread to keep it, the Source's health names it.
-    expect(h.health.github).toMatchObject({ state: 'ready', detail: '2 notifications; next poll ≥ 60s; deleted on GitHub: #14, #15' })
+    expect(h.health.github).toMatchObject({ state: 'ready', detail: '2 changes; next poll ≥ 60s; deleted on GitHub: #14, #15' })
     // GitHub also answers 404 for a private repository the agent lost access to: that is a failure read again.
-    github(h, { notifications: [notification(16)] })
+    github(h, { issues: [change(16)] })
     await expect(pollRound(h)).rejects.toThrow('#16: Error: gh: Not Found (HTTP 404)')
     expect(h.store.get('github-retry')).toEqual({ 16: expect.objectContaining({ pr: false }) })
     h.store.close()
   })
-  it('skips and counts a notification or comment it cannot read, and names the count in the health', async () => {
+  it('skips and counts a change or comment it cannot read, and names the count in the health', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
     const comment = { id: 3, body: '@agent-bot please fix', user: { login: 'alice', type: 'User' },
       html_url: 'https://github.com/acme/widgets/issues/12#issuecomment-3', created_at: '2026-09-09T00:00:00Z', updated_at: '2026-09-09T00:00:00Z' }
-    github(h, { notifications: [notification(12), { id: 'n-odd', subject: {} }], 'issues/12': issue(12,
+    github(h, { issues: [change(12), { id: 'n-odd', subject: {} }], 'issues/12': issue(12,
       { created_at: '2026-08-01T00:00:00Z' }),
       'issues/12/comments': [comment, { body: 'no id' }] })
     await pollRound(h)
     expect(h.receive.mock.calls.map(([trigger]) => trigger.text)).toEqual(['@agent-bot please fix'])
-    expect(h.health.github).toMatchObject({ state: 'ready', detail: '1 notifications; next poll ≥ 60s; 2 unreadable items skipped' })
+    expect(h.health.github).toMatchObject({ state: 'ready', detail: '1 changes; next poll ≥ 60s; 2 unreadable items skipped' })
     h.store.close()
   })
-  it('reads every page of the notifications when GitHub says there are more, and waits as long as GitHub asks', async () => {
+  it('reads every page of the changes when GitHub says there are more, and waits as long as GitHub asks', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
     const calls: string[][] = []
     vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
       calls.push(args)
       const path = args[1]!.replace(/^repos\/acme\/widgets\//, '').split('?')[0]!
-      if (path === 'notifications' && args.includes('--include')) {
-        return 'HTTP/2.0 200 OK\r\nLink: <https://api.github.com/notifications?page=2>; rel="next"\r\nX-Poll-Interval: 120\r\n\r\n[]'
+      if (path === 'issues' && args.includes('--include')) {
+        return 'HTTP/2.0 200 OK\r\nLink: <https://api.github.com/changes?page=2>; rel="next"\r\nX-Poll-Interval: 120\r\n\r\n[]'
       }
-      if (path === 'notifications') return JSON.stringify([[notification(12)], [notification(13)]])
+      if (path === 'issues') return JSON.stringify([[change(12)], [change(13)]])
       if (/^issues\/\d+$/.test(path)) return JSON.stringify(issue(Number(path.split('/')[1]), { created_at: '2026-08-01T00:00:00Z' }))
       return JSON.stringify(args.includes('--slurp') ? [[]] : [])
     })
     expect(await pollRound(h)).toBe(120)
-    const notifications = calls.filter(args => args[1]!.includes('/notifications'))
-    expect(notifications.map(args => args.includes('--paginate'))).toEqual([false, true])
+    const changes = calls.filter(args => args[1]!.startsWith('repos/acme/widgets/issues?'))
+    expect(changes.map(args => args.includes('--paginate'))).toEqual([false, true])
+    expect(changes[0]![1]).toBe(`repos/acme/widgets/issues?state=all&sort=updated&direction=asc&per_page=100&since=${encodeURIComponent('2026-09-08T00:00:00.000Z')}`)
     const paths = calls.map(args => args[1]!.split('?')[0])
     expect(paths).toEqual(expect.arrayContaining(['repos/acme/widgets/issues/12', 'repos/acme/widgets/issues/13']))
-    expect(h.health.github).toMatchObject({ state: 'ready', detail: '2 notifications; next poll ≥ 120s' })
+    expect(h.health.github).toMatchObject({ state: 'ready', detail: '2 changes; next poll ≥ 120s' })
     h.store.close()
   })
   it('drops a notified Issue whose reads fail for a day, so the Source leaves the error, and keeps its read position', async () => {
@@ -661,13 +663,13 @@ describe('github source', () => {
     h.store.threads.save({ key: 'github:16', ref: { source: 'github', id: '16' }, createdAt: '', subscriptions: [], correlated: [], pending: [],
       meta: {} })
     h.store.set('github-cursor:16', '2026-09-01T00:00:00.000Z')
-    github(h, { notifications: [notification(16)] })
+    github(h, { issues: [change(16)] })
     await expect(pollRound(h)).rejects.toThrow('#16: Error: gh: Not Found (HTTP 404)')
     const first = h.store.get<Record<string, { failedAt: string; attempts: number }>>('github-retry')![16]!
     expect(first).toMatchObject({ attempts: 1, failedAt: expect.any(String) })
     // However many reads failed, a day of failures has not passed: the read is retried, and the round still fails.
     h.store.set('github-retry', { 16: { ...first, attempts: 99 } })
-    github(h, { notifications: [] })
+    github(h, { issues: [] })
     await expect(pollRound(h)).rejects.toThrow('#16')
     // A day after the first failed read, it is dropped: its Thread keeps the error, the health names it, and the round does not
     // fail. Its read position stays, so a later read takes in what the failed reads missed.
@@ -677,16 +679,16 @@ describe('github source', () => {
     expect(h.store.get('github-cursor:16')).toBe('2026-09-01T00:00:00.000Z')
     expect(h.store.threads.get('github:16')?.meta.pollError).toContain('Not Found')
     expect(h.health.github).toMatchObject({ state: 'ready',
-      detail: '0 notifications; next poll ≥ 60s; dropped after their reads kept failing: #16' })
+      detail: '0 changes; next poll ≥ 60s; dropped after their reads kept failing: #16' })
     h.store.close()
   })
-  it('polls the PRs of open tickets and subscribed Threads although the notifications fail, and then fails the round', async () => {
+  it('polls the PRs of open tickets and subscribed Threads although the changes fail, and then fails the round', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
     h.store.threads.save({ key: 'github:7', ref: { source: 'github', id: '7' }, createdAt: '2026-09-01T00:00:00Z',
       lastAt: new Date().toISOString(), subscriptions: ['t'], correlated: [], pending: [], meta: { number: 7, isPr: false,
       title: 'Login fails' } })
-    github(h, { notifications: refused(503, 'Service Unavailable'), 'issues/7/comments': [{ id: 3, body: 'still broken',
+    github(h, { issues: refused(503, 'Service Unavailable'), 'issues/7/comments': [{ id: 3, body: 'still broken',
       user: { login: 'b', type: 'User' }, created_at: '2026-09-02T00:00:00Z', updated_at: '2026-09-02T00:00:00Z' }] })
     await expect(pollRound(h)).rejects.toThrow('HTTP 503')
     expect(h.receive).toHaveBeenCalledWith(expect.objectContaining({ text: 'still broken' }))
@@ -697,7 +699,7 @@ describe('github source', () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
     const pr = { ...openPull(9), body: '@agent-bot please review', created_at: '2026-09-09T00:00:00Z' }
-    github(h, { notifications: [notification(9, 'pulls')], 'pulls/9': pr })
+    github(h, { issues: [change(9, 'pulls')], 'pulls/9': pr })
     await pollRound(h)
     const opened = h.receive.mock.calls.map(([trigger]) => trigger).filter(trigger => trigger.meta.kind === 'pull')
     const id = issueTrigger({ ...pr, id: 9 } as GithubIssue, 'agent-bot').id
@@ -706,10 +708,10 @@ describe('github source', () => {
     // The agent's own PR, and one opened before the cursor, bring no description.
     h.receive.mockClear()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
-    github(h, { notifications: [notification(9, 'pulls')], 'pulls/9': { ...pr, user: { login: 'agent-bot' } } })
+    github(h, { issues: [change(9, 'pulls')], 'pulls/9': { ...pr, user: { login: 'agent-bot' } } })
     await pollRound(h)
     h.store.set('github-since', '2026-09-10T00:00:00.000Z')
-    github(h, { notifications: [{ ...notification(9, 'pulls'), updated_at: '2026-09-11T00:00:00Z' }], 'pulls/9': pr })
+    github(h, { issues: [{ ...change(9, 'pulls'), updated_at: '2026-09-11T00:00:00Z' }], 'pulls/9': pr })
     await pollRound(h)
     expect(h.receive.mock.calls.filter(([trigger]) => trigger.meta.kind === 'pull')).toEqual([])
     h.store.close()
@@ -736,11 +738,11 @@ describe('github source', () => {
       h.store.threads.save({ key: `github:${number}`, ref: { source: 'github', id: String(number) }, createdAt: '', subscriptions: [],
         correlated: [], pending: [], meta: {} })
     }
-    github(h, { notifications: [], 'issues/5/comments': refused(410, 'Gone'), 'pulls/7': refused(410, 'Gone') })
+    github(h, { issues: [], 'issues/5/comments': refused(410, 'Gone'), 'pulls/7': refused(410, 'Gone') })
     // Every PR read but #8's succeeds or is dropped; #8 fails like a network error.
     vi.mocked(h.commands.run).mockImplementation(async (_program, args) => {
       const path = args[1]!.replace(/^repos\/acme\/widgets\//, '').split('?')[0]!
-      if (path === 'notifications') return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      if (path === 'issues') return 'HTTP/2.0 200 OK\r\n\r\n[]'
       if (path === 'issues/5/comments' || path === 'pulls/7') throw refused(410, 'Gone')
       if (path === 'pulls/8') throw refused(502, 'Bad Gateway')
       return JSON.stringify(args.includes('--slurp') ? [[]] : [])
@@ -750,7 +752,7 @@ describe('github source', () => {
     expect(h.store.threads.get('github:7')!.meta.pollError).toContain('410')
     vi.mocked(h.commands.run).mockImplementation(async (_program, args) => {
       const path = args[1]!.replace(/^repos\/acme\/widgets\//, '').split('?')[0]!
-      if (path === 'notifications') return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      if (path === 'issues') return 'HTTP/2.0 200 OK\r\n\r\n[]'
       if (path === 'issues/5/comments' || path === 'pulls/7' || path === 'pulls/8') throw refused(410, 'Gone')
       return JSON.stringify(args.includes('--slurp') ? [[]] : [])
     })
@@ -787,7 +789,7 @@ describe('github source', () => {
         return 'HTTP/2.0 200 OK\r\n\r\n[]'
       })
       const flaky = await start({}, { enabled: true, config: { failuresBeforeError: 2 } })
-      // Each round reads its notifications once, then waits a minute for the next.
+      // Each round reads its changes once, then waits a minute for the next.
       const until = async (count: number) => {
         while (round < count) {
           await vi.waitFor(() => expect(round).toBeGreaterThan(0))
@@ -815,27 +817,25 @@ describe('github source', () => {
   const issue = (number: number, fields: Partial<GithubIssue> = {}): GithubIssue => ({ id: 1000 + number, number, title: 'Login fails',
     body: 'details', state: 'open', created_at: '2026-09-09T00:00:00Z', html_url: `https://github.com/acme/widgets/issues/${number}`,
     user: { login: 'alice', type: 'User' }, ...fields })
-  /** GitHub as `pollRound` reads it after `since`: one notification per Issue, the Issues, and their conversation comments by number. */
-  function notify(h: ReturnType<typeof host>, issues: GithubIssue[], comments: Record<number, GithubComment[]> = {},
+  /** GitHub as `pollRound` reads it after `since`: one change per Issue, the Issues, and their conversation comments by number. */
+  function discover(h: ReturnType<typeof host>, issues: GithubIssue[], comments: Record<number, GithubComment[]> = {},
     since = '2026-09-08T00:00:00.000Z') {
     h.store.set('github-since', since)
-    // A notification is as new as the latest change it reports: the Issue or its newest comment.
+    // A change is as new as the latest change it reports: the Issue or its newest comment.
     const updated = (item: GithubIssue) => [item.updated_at ?? item.created_at,
       ...(comments[item.number] ?? []).map(comment => comment.updated_at ?? '')].sort().at(-1)!
-    const notifications = issues.map(item => ({ id: `n${item.number}`, updated_at: updated(item), reason: 'mention',
-      repository: { full_name: 'acme/widgets' },
-      subject: { url: `https://api.github.com/repos/acme/widgets/issues/${item.number}`, type: 'Issue', title: item.title } }))
+    const changes = issues.map(item => ({ ...item, updated_at: updated(item) }))
     // An Issue that is a PR also answers as the PR.
-    const routes: Record<string, unknown> = { notifications, ...Object.fromEntries(issues.flatMap(item => [[`issues/${item.number}`, item],
+    const routes: Record<string, unknown> = { issues: changes, ...Object.fromEntries(issues.flatMap(item => [[`issues/${item.number}`, item],
       [`pulls/${item.number}`, openPull(item.number)],
       [`issues/${item.number}/comments`, comments[item.number] ?? []]])) }
     return { routes, reads: github(h, routes) }
   }
-  it('takes in a new Issue from its notification as a Trigger with its body, addressed to the agent when the body mentions it', async () => {
+  it('takes in a new Issue from its change as a Trigger with its body, addressed to the agent when the body mentions it', async () => {
     const h = host()
     // A pull request reported at its Issue address, and an Issue the agent opened itself, add nothing.
     const agents = { user: { login: 'agent-bot', type: 'User' } }
-    notify(h, [issue(12, { body: '@agent-bot please fix the login' }), issue(13, { pull_request: { url: 'x' } }), issue(14, agents)])
+    discover(h, [issue(12, { body: '@agent-bot please fix the login' }), issue(13, { pull_request: { url: 'x' } }), issue(14, agents)])
     await pollRound(h)
     expect(h.receive).toHaveBeenCalledOnce()
     const id = key('github-issue', '12')
@@ -849,24 +849,81 @@ describe('github source', () => {
     expect(h.store.threads.get('github:12')!.meta).toMatchObject({ title: 'Login fails', label: '#12 Login fails' })
     h.store.close()
   })
-  it('takes in a comment on an earlier Issue from its notification, without the Issue body', async () => {
+  it('takes in a comment on an earlier Issue from its change, without the Issue body', async () => {
     const h = host()
     const url = 'https://github.com/acme/widgets/issues/12'
     const comment: GithubComment = { id: 5, body: '@agent-bot can you take this?', user: { login: 'alice', type: 'User' },
       html_url: `${url}#issuecomment-5`, created_at: '2026-09-09T00:00:00Z', updated_at: '2026-09-09T00:00:00Z' }
-    const { reads } = notify(h, [issue(12, { created_at: '2026-08-01T00:00:00Z' })], { 12: [comment] })
+    const { reads } = discover(h, [issue(12, { created_at: '2026-08-01T00:00:00Z' })], { 12: [comment] })
     await pollRound(h)
     const expected = commentTrigger(comment, { number: 12, isPr: false, url }, 'conversation', 'agent-bot')
     expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([expected])
-    // An Issue has only its conversation; the comments are read since the notification cursor.
+    // An Issue has only its conversation; the comments are read since the change cursor.
     const since = encodeURIComponent('2026-09-08T00:00:00.000Z')
     expect(reads.filter(path => path.includes('/comments'))).toEqual([`issues/12/comments?per_page=100&since=${since}`])
+    h.store.close()
+  })
+  it('discovers human mentions with observation off, including on self-created Issues, without promoting bots or strangers', async () => {
+    const h = host()
+    h.deployment.github.login = 'agent-bot[bot]'
+    const settings = h.store.settings()
+    h.store.saveSettings({ ...settings, sources: { ...settings.sources, github: { enabled: true, config: {} } },
+      policy: { ...settings.policy, sources: { ...settings.policy.sources,
+        github: { allowed: [{ id: 'alice' }], bots: [{ id: 'dependabot[bot]' }] } } } })
+    const comment = (id: number, login: string, type = 'User'): GithubComment => ({ id, body: '@agent-bot[bot] please fix',
+      user: { login, type }, created_at: '2026-09-09T00:00:00Z', updated_at: '2026-09-09T00:00:00Z' })
+    const self = issue(12, { user: { login: 'agent-bot[bot]', type: 'Bot' } })
+    discover(h, [self, issue(13, { body: '@agent-bot[bot] fix' }), issue(14, { body: '@agent-bot[bot] fix', user: { login: 'stranger' } })],
+      { 12: [comment(1, 'alice'), comment(2, 'stranger'), comment(3, 'agent-bot[bot]', 'Bot'), comment(4, 'dependabot[bot]', 'Bot')] })
+    await pollRound(h)
+    const saved = h.store.read.threadTriggers('github:12', 20)
+    expect(saved.map(trigger => trigger.actor.id).sort()).toEqual(['alice', 'dependabot[bot]', 'stranger'])
+    const human = saved.find(trigger => trigger.actor.id === 'alice')!
+    const bot = saved.find(trigger => trigger.actor.id === 'dependabot[bot]')!
+    const stranger = saved.find(trigger => trigger.actor.id === 'stranger')!
+    expect(h.engine.candidate(human.id)?.strength).toBe('explicit')
+    expect(h.engine.candidate(bot.id)?.strength).toBe('inferred')
+    expect(bot.human).toBe(false)
+    expect(h.engine.candidate(stranger.id)?.strength).not.toBe('explicit')
+    expect(h.engine.candidate(key('github-issue', '13'))?.strength).toBe('explicit')
+    expect(h.engine.candidate(key('github-issue', '14'))?.strength).not.toBe('explicit')
+    expect(h.store.triggers.get(key('github-issue', '12'))).toBeUndefined()
+    h.store.close()
+  })
+  it('keeps discovery cursor and pending retries on a later-page failure, then retries pending threads before new ones', async () => {
+    const h = host()
+    const since = '2026-09-08T00:00:00.000Z'
+    const pending = { 20: { since, pr: false, attempts: 1, failedAt: new Date().toISOString() } }
+    h.store.set('github-since', since); h.store.set('github-retry', pending)
+    let fail = true
+    const reads: string[] = []
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const path = args[1]!.replace(/^repos\/acme\/widgets\//, '').split('?')[0]!
+      reads.push(path)
+      if (path === 'issues') {
+        if (args.includes('--include')) return `HTTP/2.0 200 OK\r\nLink: <https://untrusted.invalid/>; rel="next"\r\n\r\n${JSON.stringify([issue(12)])}`
+        if (fail) throw refused(502, 'later page failed')
+        return JSON.stringify([[issue(12)], [issue(13)]])
+      }
+      if (/^issues\/\d+$/.test(path)) return JSON.stringify(issue(Number(path.split('/')[1]), { body: '@agent-bot fix' }))
+      return JSON.stringify([[]])
+    })
+    await expect(pollRound(h)).rejects.toThrow('later page failed')
+    expect(h.store.get('github-since')).toBe(since)
+    expect(h.store.get('github-retry')).toEqual(pending)
+    expect(h.store.triggers.get(key('github-issue', '12'))).toBeUndefined()
+    fail = false; reads.length = 0
+    await pollRound(h)
+    expect(reads.filter(path => /^issues\/\d+$/.test(path))).toEqual(['issues/20', 'issues/12', 'issues/13'])
+    expect(h.store.get('github-retry')).toEqual({})
+    expect(h.store.triggers.get(key('github-issue', '13'))?.text).toContain('@agent-bot fix')
+    expect(h.store.decisions.byThread('github:13')).toHaveLength(1)
     h.store.close()
   })
   it('keeps one body Trigger for an Issue that a later poll reads again', async () => {
     const h = host()
     // Opened just before the poll, the Issue is still after the cursor the next poll reads from.
-    notify(h, [issue(12, { created_at: new Date(Date.now() - 1000).toISOString() })], {}, new Date(Date.now() - 60_000).toISOString())
+    discover(h, [issue(12, { created_at: new Date(Date.now() - 1000).toISOString() })], {}, new Date(Date.now() - 60_000).toISOString())
     await pollRound(h)
     await pollRound(h)
     expect(h.receive).toHaveBeenCalledTimes(2)
@@ -876,7 +933,7 @@ describe('github source', () => {
   })
   it('takes in an Issue without a mention as a Trigger that is not addressed, and a bot\'s Issue as automated', async () => {
     const h = host()
-    notify(h, [issue(12, { body: 'Login fails on Safari' }), issue(15, { user: { login: 'dependabot[bot]', type: 'Bot' } })])
+    discover(h, [issue(12, { body: 'Login fails on Safari' }), issue(15, { user: { login: 'dependabot[bot]', type: 'Bot' } })])
     await pollRound(h)
     const taken = (number: number) => h.receive.mock.calls.map(([trigger]) => trigger).find(trigger => trigger.meta.number === number)
     const [plain, bot] = [taken(12), taken(15)]
@@ -894,7 +951,7 @@ describe('github source', () => {
       human: true, at: '2026-09-09T00:00:00Z', text: 'Login fails\n\n@agent-bot please fix the login', meta: { number: 12, isPr: false,
         eligibleAt: '' } }
     h.store.triggers.save(stored)
-    notify(h, [issue(12, { body: '@agent-bot please fix the login' })])
+    discover(h, [issue(12, { body: '@agent-bot please fix the login' })])
     await pollRound(h)
     expect(await h.receive.mock.results[0]!.value).toBe('duplicate')
     expect(h.store.read.threadTriggers('github:12', 10)).toEqual([stored])
@@ -905,22 +962,22 @@ describe('github source', () => {
     // Whoever edits the body, its author would be the actor, so a mention added by an edit is not read.
     const edited = issue(12, { created_at: '2026-08-01T00:00:00Z', updated_at: '2026-09-09T00:00:00Z',
       body: 'Login fails. @agent-bot can you look?' })
-    notify(h, [edited])
+    discover(h, [edited])
     await pollRound(h)
     expect(h.receive).not.toHaveBeenCalled()
     h.store.close()
   })
-  it('reads a PR that a notification names by its Issue address as the PR', async () => {
+  it('reads a PR that a change names by its Issue address as the PR', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
     const review = { id: 4, state: 'APPROVED', commit_id: 'abc', user: { login: 'carol', type: 'User' },
       submitted_at: '2026-09-09T00:00:00Z' }
-    const reads = github(h, { notifications: [notification(9)], 'issues/9': { ...issue(9), pull_request: { url: 'x' } },
+    const reads = github(h, { issues: [change(9)], 'issues/9': { ...issue(9), pull_request: { url: 'x' } },
       'pulls/9/reviews': [review],
       'pulls/9': { title: 'Fix', state: 'open', html_url: 'https://github.com/acme/widgets/pull/9', user: { login: 'carol' },
         head: { sha: 'abc', ref: 'fix', repo: null } } })
     await pollRound(h)
-    expect(bare(reads)).toEqual(['notifications', 'issues/9', 'pulls/9', 'issues/9/comments', 'pulls/9/comments', 'pulls/9/reviews'])
+    expect(bare(reads)).toEqual(['issues', 'issues/9', 'pulls/9', 'issues/9/comments', 'pulls/9/comments', 'pulls/9/reviews'])
     expect(h.receive.mock.calls.map(([trigger]) => trigger)).toEqual([expect.objectContaining({ text: 'APPROVED review of commit abc',
       meta: expect.objectContaining({ isPr: true }) })])
     h.store.close()
@@ -929,7 +986,7 @@ describe('github source', () => {
     const h = host()
     const comment: GithubComment = { id: 5, body: 'more', user: { login: 'alice', type: 'User' }, created_at: '2026-09-09T00:00:00Z',
       updated_at: '2026-09-09T00:00:00Z' }
-    const { routes } = notify(h, [issue(12, { created_at: '2026-08-01T00:00:00Z' })], { 12: [comment] })
+    const { routes } = discover(h, [issue(12, { created_at: '2026-08-01T00:00:00Z' })], { 12: [comment] })
     routes['issues/12/comments'] = () => {
       h.store.saveSettings({ ...h.store.settings(), sources: { ...h.store.settings().sources, github: { enabled: false, config: {} } } })
       return [comment]
@@ -1043,7 +1100,7 @@ describe('feishu event consumer', () => {
    * A bot CLI whose `event consume` behaves as `mode` says: `never` gets ready, `warn` warns once ready, `ready` stays up,
    * and `flaky` exits after its first ready. It records each run and the PID of the latest.
    */
-  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
+  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late' | 'late-ready'): string {
     const path = join(dir, 'lark-bot')
     writeFileSync(path, `#!/bin/sh
   [ "$1" = event ] || { echo '{"ok":true,"data":{}}'; exit 0; }
@@ -1055,6 +1112,7 @@ describe('feishu event consumer', () => {
     flaky) echo '[event] ready' >&2; [ "$n" -gt 1 ] && exec sleep 60; exit 1 ;;
     events) echo '[event] ready' >&2; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
     late) echo '[event] ready' >&2; sleep 1; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
+    late-ready) cat '${dir}/events'; while [ ! -f '${dir}/release' ]; do sleep 0.01; done; echo '[event] ready' >&2; touch '${dir}/printed'; exec sleep 60 ;;
   esac
   `, { mode: 0o755 })
     return path
@@ -1096,6 +1154,19 @@ describe('feishu event consumer', () => {
     expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
     expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
     controller.abort(); await running; store.close()
+  }, 20_000)
+  it('keeps a malformed event error when readiness arrives later on stderr', async () => {
+    writeFileSync(join(dir, 'events'), 'not json\n' + event('om_after_error', 'oc_group', 'group') + '\n')
+    const { ctx, health, store } = consumerSource(cli('late-ready'))
+    try {
+      running = runFeishu(ctx, controller.signal)
+      await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_after_error'))).toBeDefined(), until)
+      expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+      writeFileSync(join(dir, 'release'), '')
+      await vi.waitFor(() => expect(existsSync(join(dir, 'printed'))).toBe(true), until)
+      controller.abort(); await running
+      expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+    } finally { controller.abort(); await running; store.close() }
   }, 20_000)
   it('drops the events it reads once the Source is off', async () => {
     writeFileSync(join(dir, 'events'), event('om_9', 'oc_group', 'group') + '\n')
@@ -1194,14 +1265,20 @@ describe('observing the GitHub repository', () => {
   const observe = (h: ReturnType<typeof host>, config: Record<string, boolean>) =>
     h.store.saveSettings({ ...h.store.settings(), sources: { ...h.store.settings().sources, github: { enabled: true, config } } })
   /** GitHub as the repository's lists and its default branch answer; a request with the ETag of an unchanged list answers 304. */
-  function repository(h: ReturnType<typeof host>, answers: { issues?: unknown[]; comments?: unknown[]; reviewComments?: unknown[];
-    branch?: { sha: string; checks: unknown[] } }) {
+  function repository(h: ReturnType<typeof host>, answers: { issues?: GithubIssue[]; discovery?: GithubIssue[];
+    comments?: unknown[]; reviewComments?: unknown[]; branch?: { sha: string; checks: unknown[] } }) {
+    // Return optional-stream calls only; discovery has its own cursor and independent response.
     const calls: string[][] = []
     vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const request = new URL(args[1]!, 'https://api.github.com/')
+      const bare = request.pathname.replace(/^\/repos\/acme\/widgets\/?/, '')
+      const listed = (list: unknown[] | undefined) => args.includes('--include')
+        ? `HTTP/2.0 200 OK\r\nETag: "same"\r\n\r\n${JSON.stringify(list ?? [])}`
+        : JSON.stringify(args.includes('--slurp') ? [list ?? []] : list ?? [])
+      if (bare === 'issues' && request.searchParams.get('since') === h.store.get('github-since')) return listed(answers.discovery)
       calls.push(args)
-      const bare = args[1]!.replace(/^repos\/acme\/widgets\/?/, '').split('?')[0]!
-      const listed = (list: unknown[] | undefined) => `HTTP/2.0 200 OK\r\nETag: "same"\r\n\r\n${JSON.stringify(list ?? [])}`
-      if (bare === 'notifications') return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      const detail = [...answers.discovery ?? [], ...answers.issues ?? []].find(item => bare === `issues/${item.number}` || bare === `pulls/${item.number}`)
+      if (detail) return JSON.stringify(bare.startsWith('pulls/') ? { ...openPull(detail.number), ...detail } : detail)
       if (args.includes('If-None-Match: "same"')) throw commandError({ stderr: 'gh: HTTP 304', code: 1 })
       if (bare === 'issues') return listed(answers.issues)
       if (bare === 'issues/comments') return listed(answers.comments)
@@ -1242,6 +1319,74 @@ describe('observing the GitHub repository', () => {
     observe(h, {})
     await pollRound(h)
     expect(h.store.get('github-stream:issues')).toBeUndefined()
+    h.store.close()
+  })
+  it.each(['issues', 'comments', 'review-comments'])('finishes every page of %s before advancing and never caches a multipage ETag', async stream => {
+    const h = host()
+    observe(h, { observeIssues: stream === 'issues', observeComments: stream !== 'issues' })
+    h.store.set('github-since', at(-24))
+    const kind = stream === 'issues' ? 'issues' : 'comments'
+    const checkpoint = { since: at(0), started: { [kind]: at(0) } }
+    h.store.set(`github-stream:${stream}`, checkpoint)
+    const endpoint = stream === 'issues' ? 'issues' : stream === 'comments' ? 'issues/comments' : 'pulls/comments'
+    const item = (number: number) => stream === 'issues' ? issue(number, { created_at: at(1), updated_at: at(1) })
+      : { id: number, body: 'new comment', user: { login: 'alice', type: 'User' }, created_at: at(1), updated_at: at(1),
+        issue_url: `https://api.github.com/repos/acme/widgets/issues/${number}`,
+        pull_request_url: `https://api.github.com/repos/acme/widgets/pulls/${number}`,
+        html_url: `https://github.com/acme/widgets/issues/${number}#issuecomment-${number}` }
+    let fail = true
+    let later = [item(7)]
+    const requests: string[][] = []
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const request = new URL(args[1]!, 'https://api.github.com/')
+      const bare = request.pathname.replace(/^\/repos\/acme\/widgets\//, '')
+      if (bare === 'issues' && request.searchParams.get('since') === h.store.get('github-since')) return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      if (bare !== endpoint) return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      requests.push(args)
+      // Only the first page is unchanged. A later page changes even while the cursor stays put.
+      if (args.includes('If-None-Match: "first"')) throw refused(304, 'Not Modified')
+      if (args.includes('--include')) return 'HTTP/2.0 200 OK\r\nETag: "first"\r\nLink: <https://untrusted.invalid/>; rel="next"\r\n\r\n[]'
+      if (fail) throw refused(502, 'later page failed')
+      return JSON.stringify([[], later])
+    })
+    await expect(pollRound(h)).rejects.toThrow('later page failed')
+    expect(h.store.get(`github-stream:${stream}`)).toEqual(checkpoint)
+    expect(h.store.read.threadTriggers('github:7', 10)).toEqual([])
+    fail = false
+    await pollRound(h); await pollRound(h)
+    expect(h.store.get(`github-stream:${stream}`)).toEqual({ since: cursorAt(at(1)), started: checkpoint.started })
+    later = [item(7), item(8)]
+    await pollRound(h)
+    for (const number of [7, 8]) {
+      expect(h.store.read.threadTriggers(`github:${number}`, 10)).toHaveLength(1)
+      expect(h.store.decisions.byThread(`github:${number}`)).toHaveLength(1)
+    }
+    expect(requests.every(args => args[1]!.startsWith(`repos/acme/widgets/${endpoint}?`))).toBe(true)
+    expect(requests.some(args => args.includes('--paginate') && args.includes('--slurp'))).toBe(true)
+    expect(requests.some(args => args.includes('If-None-Match: "first"'))).toBe(false)
+    h.store.close()
+  })
+  it('deduplicates discovery and optional streams in saved triggers and decisions, including overlapping polls', async () => {
+    const h = host()
+    observe(h, { observeIssues: true, observeComments: true })
+    const since = new Date(Date.now() - 60_000).toISOString()
+    const now = new Date(Date.now() - 1000).toISOString()
+    h.store.set('github-since', since)
+    h.store.set('github-stream:issues', { since, started: { issues: since } })
+    h.store.set('github-stream:comments', { since, started: { comments: since } })
+    const changed = issue(7, { created_at: now, updated_at: now, body: '@agent-bot fix', user: { login: 'alice', type: 'User' } })
+    const comment = { id: 4, body: '@agent-bot also this', user: { login: 'alice', type: 'User' }, created_at: now, updated_at: now,
+      issue_url: 'https://api.github.com/repos/acme/widgets/issues/7', html_url: 'https://github.com/acme/widgets/issues/7#issuecomment-4' }
+    repository(h, { discovery: [changed], issues: [changed], comments: [comment] })
+    const answer = vi.mocked(h.commands.run).getMockImplementation()!
+    vi.mocked(h.commands.run).mockImplementation(async (program, args) => args[1]!.startsWith('repos/acme/widgets/issues/7/comments?')
+      ? JSON.stringify([[comment]]) : answer(program, args))
+    await pollRound(h); await pollRound(h)
+    const triggers = h.store.read.threadTriggers('github:7', 20)
+    expect(triggers).toHaveLength(2)
+    expect(triggers.map(trigger => trigger.meta.kind).sort()).toEqual(['conversation', 'issue'])
+    const decisions = h.store.decisions.byThread('github:7')
+    expect(decisions.flatMap(decision => decision.triggerIds).sort()).toEqual(triggers.map(trigger => trigger.id).sort())
     h.store.close()
   })
   it('takes in the repository\'s conversation and review comments, on the Issue or PR each is on', async () => {
