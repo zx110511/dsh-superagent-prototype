@@ -3,3 +3,6 @@ lib/
 .artifacts/
 .env
 coverage/
+
+# GitHub App credentials (PRIVATE)
+.github/
